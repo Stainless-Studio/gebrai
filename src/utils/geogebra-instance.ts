@@ -1048,6 +1048,232 @@ export class GeoGebraInstance implements GeoGebraAPI {
   }
 
   /**
+   * Export construction as GeoGebra file (.ggb) in base64 format
+   */
+  async exportGGB(): Promise<string> {
+    this.ensureInitialized();
+    this.updateActivity();
+
+    return this.retryOperation(async () => {
+      const ggbBase64 = await this.page!.evaluate(() => {
+        try {
+          const applet = (window as any).ggbApplet;
+          if (!applet) {
+            throw new Error('GeoGebra applet not available');
+          }
+          
+          if (typeof applet.getBase64 !== 'function') {
+            throw new Error('getBase64 method not available on applet');
+          }
+
+          // Get the construction as base64-encoded .ggb file
+          const result = applet.getBase64();
+          
+          if (!result || typeof result !== 'string') {
+            throw new Error('getBase64 returned invalid result');
+          }
+          
+          return result;
+        } catch (error) {
+          throw new Error(`GGB export failed: ${error.message || error}`);
+        }
+      });
+
+      // Validate the result
+      if (!ggbBase64) {
+        throw new Error('GGB export returned null or undefined');
+      }
+      
+      if (typeof ggbBase64 !== 'string') {
+        throw new Error(`GGB export returned invalid type: ${typeof ggbBase64}`);
+      }
+      
+      if (ggbBase64.length === 0) {
+        throw new Error('GGB export returned empty string');
+      }
+      
+      // Validate base64 format
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(ggbBase64)) {
+        throw new Error(`Result is not valid base64. Length: ${ggbBase64.length}`);
+      }
+      
+      // Check for minimum reasonable size
+      if (ggbBase64.length < 100) {
+        throw new Error(`GGB result suspiciously small (${ggbBase64.length} characters)`);
+      }
+
+      logger.debug(`GGB file exported from instance ${this.id}, result length: ${ggbBase64.length}`);
+      return ggbBase64;
+    }, 3, 1000, 'GGB export');
+  }
+
+  /**
+   * Validate that a file path is within the workspace directory to prevent path traversal attacks
+   * @param filePath - The file path to validate
+   * @param workspaceDir - The workspace directory
+   * @returns The validated absolute path
+   * @throws Error if path is outside workspace
+   */
+  private validateFilePath(filePath: string, workspaceDir: string): string {
+    const path = require('path');
+    const fullPath = path.resolve(workspaceDir, filePath);
+    const normalizedWorkspace = path.resolve(workspaceDir);
+    
+    // Check if the resolved path is within the workspace
+    if (!fullPath.startsWith(normalizedWorkspace + path.sep) && fullPath !== normalizedWorkspace) {
+      throw new Error(`Path traversal detected: ${filePath} resolves outside workspace`);
+    }
+    
+    return fullPath;
+  }
+
+  /**
+   * Calculate optimal view coordinates to fit all visible objects
+   * @param padding - Padding percentage around objects (default: 0.2 for 20% margin)
+   * @param minRange - Minimum range for each axis (default: 2)
+   * @returns View coordinates {xmin, xmax, ymin, ymax} or null if no visible points
+   */
+  async calculateAutoZoomCoordinates(padding: number = 0.2, minRange: number = 2): Promise<{xmin: number, xmax: number, ymin: number, ymax: number} | null> {
+    this.ensureInitialized();
+    this.updateActivity();
+    
+    const objectNames = await this.getAllObjectNames();
+    const allObjects = [];
+    for (const name of objectNames) {
+      const info = await this.getObjectInfo(name);
+      if (info) {
+        allObjects.push(info);
+      }
+    }
+    
+    const visiblePoints = allObjects.filter((obj: any) =>
+      obj.type === 'point' && obj.visible && obj.defined &&
+      typeof obj.x === 'number' && typeof obj.y === 'number'
+    );
+    
+    if (visiblePoints.length === 0) {
+      return null;
+    }
+    
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    
+    for (const point of visiblePoints) {
+      minX = Math.min(minX, point.x!);
+      maxX = Math.max(maxX, point.x!);
+      minY = Math.min(minY, point.y!);
+      maxY = Math.max(maxY, point.y!);
+    }
+    
+    let rangeX = maxX - minX;
+    let rangeY = maxY - minY;
+    
+    // Ensure minimum range
+    if (rangeX < minRange) {
+      const center = (minX + maxX) / 2;
+      minX = center - minRange / 2;
+      maxX = center + minRange / 2;
+      rangeX = minRange;
+    }
+    
+    if (rangeY < minRange) {
+      const center = (minY + maxY) / 2;
+      minY = center - minRange / 2;
+      maxY = center + minRange / 2;
+      rangeY = minRange;
+    }
+    
+    // Apply padding
+    const padX = rangeX * padding;
+    const padY = rangeY * padding;
+    
+    return {
+      xmin: minX - padX,
+      xmax: maxX + padX,
+      ymin: minY - padY,
+      ymax: maxY + padY
+    };
+  }
+
+  /**
+   * Apply auto-zoom to fit all visible objects
+   * @param padding - Padding percentage around objects (default: 0.2 for 20% margin)
+   * @param minRange - Minimum range for each axis (default: 2)
+   * @returns true if auto-zoom was applied, false if no visible points
+   */
+  async applyAutoZoom(padding: number = 0.2, minRange: number = 2): Promise<boolean> {
+    const coords = await this.calculateAutoZoomCoordinates(padding, minRange);
+    if (coords) {
+      await this.setCoordSystem(coords.xmin, coords.xmax, coords.ymin, coords.ymax);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Load a GeoGebra construction from a .ggb file
+   * @param ggbBase64OrPath - Either base64-encoded .ggb content or file path
+   */
+  async loadGGB(ggbBase64OrPath: string): Promise<void> {
+    this.ensureInitialized();
+    this.updateActivity();
+
+    return this.retryOperation(async () => {
+      let ggbBase64 = ggbBase64OrPath;
+      
+      // Check if it's a file path (contains path separators or ends with .ggb)
+      if (ggbBase64OrPath.includes('/') || ggbBase64OrPath.includes('\\') || ggbBase64OrPath.endsWith('.ggb')) {
+        // It's a file path, read the file
+        const fs = await import('fs/promises');
+        const path = await import('path');
+        
+        // Resolve path relative to workspace or current directory
+        const workspaceDir = process.env['VSCODE_WORKSPACE_FOLDER'] || process.cwd();
+        const fullPath = this.validateFilePath(ggbBase64OrPath, workspaceDir);
+        
+        try {
+          await fs.access(fullPath);
+        } catch (error) {
+          throw new Error(`GGB file not found: ${fullPath}`);
+        }
+        
+        // Read file and convert to base64 (async)
+        const buffer = await fs.readFile(fullPath);
+        ggbBase64 = buffer.toString('base64');
+      }
+      
+      // Validate base64 format
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(ggbBase64)) {
+        throw new Error('Invalid base64 format for GGB data');
+      }
+      
+      await this.page!.evaluate((base64Data: string) => {
+        try {
+          const applet = (window as any).ggbApplet;
+          if (!applet) {
+            throw new Error('GeoGebra applet not available');
+          }
+          
+          if (typeof applet.setBase64 !== 'function') {
+            throw new Error('setBase64 method not available on applet');
+          }
+
+          // Load the construction from base64
+          applet.setBase64(base64Data);
+          
+        } catch (error) {
+          const err = error as Error;
+          throw new Error(`GGB load failed: ${err.message || String(error)}`);
+        }
+      }, ggbBase64);
+
+      logger.debug(`GGB file loaded into instance ${this.id}`);
+    }, 3, 1000, 'GGB load');
+  }
+
+  /**
    * Export animation as GIF or video frames
    * GEB-17: Enhanced with comprehensive applet availability checks
    */

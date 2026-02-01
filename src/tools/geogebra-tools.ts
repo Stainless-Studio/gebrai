@@ -2,6 +2,8 @@ import { ToolDefinition } from '../types/mcp';
 // import { MockGeoGebraInstance } from '../utils/geogebra-mock'; // Mock implementation for testing
 import { GeoGebraInstance } from '../utils/geogebra-instance'; // Real implementation (production)
 import logger from '../utils/logger';
+import fs from 'fs';
+import path from 'path';
 import { 
   validateObjectName, 
   validateCoordinates, 
@@ -657,11 +659,153 @@ export const geogebraTools: ToolDefinition[] = [
 
   {
     tool: {
+      name: 'geogebra_auto_zoom',
+      description: 'Automatically calculate and set the optimal view to fit all visible objects with padding',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          padding: {
+            type: 'number',
+            description: 'Padding percentage around objects (default: 0.2 for 20% margin)'
+          },
+          minRange: {
+            type: 'number',
+            description: 'Minimum range for each axis (default: 2)'
+          }
+        },
+        required: []
+      }
+    },
+    handler: async (params) => {
+      try {
+        const padding = (params['padding'] as number) ?? 0.2;
+        const minRange = (params['minRange'] as number) ?? 2;
+        
+        const instance = await instancePool.getDefaultInstance();
+        
+        // Get all objects
+        const objectNames = await instance.getAllObjectNames();
+        const allObjects = [];
+        for (const name of objectNames) {
+          const info = await instance.getObjectInfo(name);
+          if (info) {
+            allObjects.push(info);
+          }
+        }
+        
+        // Filter visible points
+        const visiblePoints = allObjects.filter((obj: any) =>
+          obj.type === 'point' && obj.visible && obj.defined &&
+          typeof obj.x === 'number' && typeof obj.y === 'number'
+        );
+        
+        if (visiblePoints.length === 0) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: 'No visible points found to calculate zoom'
+              }, null, 2)
+            }],
+            isError: true
+          };
+        }
+        
+        // Calculate bounding box
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+        
+        for (const point of visiblePoints) {
+          minX = Math.min(minX, point.x!);
+          maxX = Math.max(maxX, point.x!);
+          minY = Math.min(minY, point.y!);
+          maxY = Math.max(maxY, point.y!);
+        }
+        
+        // Calculate ranges
+        let rangeX = maxX - minX;
+        let rangeY = maxY - minY;
+        
+        // Ensure minimum range
+        if (rangeX < minRange) {
+          const center = (minX + maxX) / 2;
+          minX = center - minRange / 2;
+          maxX = center + minRange / 2;
+          rangeX = minRange;
+        }
+        
+        if (rangeY < minRange) {
+          const center = (minY + maxY) / 2;
+          minY = center - minRange / 2;
+          maxY = center + minRange / 2;
+          rangeY = minRange;
+        }
+        
+        // Add padding
+        const padX = rangeX * padding;
+        const padY = rangeY * padding;
+        
+        const viewXMin = minX - padX;
+        const viewXMax = maxX + padX;
+        const viewYMin = minY - padY;
+        const viewYMax = maxY + padY;
+        
+        // Set the coordinate system
+        await instance.setCoordSystem(viewXMin, viewXMax, viewYMin, viewYMax);
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              message: 'View automatically adjusted to fit all objects',
+              pointsAnalyzed: visiblePoints.length,
+              boundingBox: {
+                minX,
+                maxX,
+                minY,
+                maxY
+              },
+              viewRange: {
+                xmin: viewXMin,
+                xmax: viewXMax,
+                ymin: viewYMin,
+                ymax: viewYMax
+              },
+              padding: padding * 100 + '%'
+            }, null, 2)
+          }]
+        };
+      } catch (error) {
+        logger.error('Failed to auto-zoom', error);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: error instanceof Error ? error.message : String(error)
+            }, null, 2)
+          }],
+          isError: true
+        };
+      }
+    }
+  },
+
+  {
+    tool: {
       name: 'geogebra_export_png',
       description: 'Export the current GeoGebra construction as PNG with configurable dimensions, quality, and view settings',
       inputSchema: {
         type: 'object',
         properties: {
+          filename: {
+            type: 'string',
+            description: 'Output filename for the PNG file (e.g., "ellipse.png"). If provided, saves to file instead of returning base64.'
+          },
           scale: {
             type: 'number',
             description: 'Scale factor for the exported image (default: 1)'
@@ -705,6 +849,18 @@ export const geogebraTools: ToolDefinition[] = [
           showGrid: {
             type: 'boolean',
             description: 'Whether to show coordinate grid (default: false)'
+          },
+          autoZoom: {
+            type: 'boolean',
+            description: 'Automatically zoom to fit all visible objects before exporting (default: false)'
+          },
+          zoomPadding: {
+            type: 'number',
+            description: 'Padding percentage for auto-zoom (default: 0.2 for 20% margin)'
+          },
+          minRange: {
+            type: 'number',
+            description: 'Minimum range for each axis when auto-zooming (default: 2)'
           }
         },
         required: []
@@ -713,17 +869,21 @@ export const geogebraTools: ToolDefinition[] = [
     handler: async (params) => {
       try {
         // Input validation with safe defaults
+        const filename = params['filename'] as string | undefined;
         let scale = (params['scale'] as number) || 1;
         let width = params['width'] as number;
         let height = params['height'] as number;
         const transparent = (params['transparent'] as boolean) || false;
         let dpi = (params['dpi'] as number) || 72;
-        const xmin = params['xmin'] as number;
-        const xmax = params['xmax'] as number;
-        const ymin = params['ymin'] as number;
-        const ymax = params['ymax'] as number;
+        let xmin = params['xmin'] as number;
+        let xmax = params['xmax'] as number;
+        let ymin = params['ymin'] as number;
+        let ymax = params['ymax'] as number;
         const showAxes = params['showAxes'] !== undefined ? (params['showAxes'] as boolean) : true;
         const showGrid = (params['showGrid'] as boolean) || false;
+        const autoZoom = (params['autoZoom'] as boolean) || false;
+        const zoomPadding = (params['zoomPadding'] as number) ?? 0.2;
+        const minRange = (params['minRange'] as number) ?? 2;
         
         // Validate and clamp values for safety
         if (scale !== undefined) {
@@ -741,7 +901,18 @@ export const geogebraTools: ToolDefinition[] = [
         
         const instance = await instancePool.getDefaultInstance();
         
-        // Apply view settings if specified
+        // Auto-zoom if requested (and manual coordinates not provided)
+        if (autoZoom && xmin === undefined && xmax === undefined && ymin === undefined && ymax === undefined) {
+          const coords = await instance.calculateAutoZoomCoordinates(zoomPadding, minRange);
+          if (coords) {
+            xmin = coords.xmin;
+            xmax = coords.xmax;
+            ymin = coords.ymin;
+            ymax = coords.ymax;
+          }
+        }
+        
+        // Apply view settings if specified or calculated by auto-zoom
         if (xmin !== undefined && xmax !== undefined && ymin !== undefined && ymax !== undefined) {
           await instance.setCoordSystem(xmin, xmax, ymin, ymax);
         }
@@ -756,6 +927,36 @@ export const geogebraTools: ToolDefinition[] = [
         
         // Export with enhanced parameters
         const pngBase64 = await instance.exportPNG(scale, transparent, dpi, width, height);
+        
+        // If filename is provided, save to file
+        if (filename) {
+          const workspaceDir = process.env['VSCODE_WORKSPACE_FOLDER'] || process.cwd();
+          const fullPath = instance['validateFilePath'](filename, workspaceDir);
+          const buffer = Buffer.from(pngBase64, 'base64');
+          await fs.promises.writeFile(fullPath, buffer);
+          
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                format: 'PNG',
+                saved: true,
+                filename: fullPath,
+                scale,
+                width,
+                height,
+                transparent,
+                dpi,
+                viewSettings: {
+                  coordSystem: (xmin !== undefined && xmax !== undefined && ymin !== undefined && ymax !== undefined) ? { xmin, xmax, ymin, ymax } : undefined,
+                  showAxes,
+                  showGrid
+                }
+              }, null, 2)
+            }]
+          };
+        }
         
         return {
           content: [{
@@ -801,6 +1002,10 @@ export const geogebraTools: ToolDefinition[] = [
       inputSchema: {
         type: 'object',
         properties: {
+          filename: {
+            type: 'string',
+            description: 'Output filename for the SVG file (e.g., "diagram.svg"). If provided, saves to file instead of returning SVG data.'
+          },
           xmin: {
             type: 'number',
             description: 'Minimum x-coordinate for view range'
@@ -824,6 +1029,14 @@ export const geogebraTools: ToolDefinition[] = [
           showGrid: {
             type: 'boolean',
             description: 'Whether to show coordinate grid (default: false)'
+          },
+          autoZoom: {
+            type: 'boolean',
+            description: 'Automatically zoom to fit all visible objects before exporting (default: false)'
+          },
+          zoomPadding: {
+            type: 'number',
+            description: 'Padding percentage for auto-zoom (default: 0.2 for 20% margin)'
           }
         },
         required: []
@@ -831,16 +1044,76 @@ export const geogebraTools: ToolDefinition[] = [
     },
     handler: async (params) => {
       try {
-        const xmin = params['xmin'] as number;
-        const xmax = params['xmax'] as number;
-        const ymin = params['ymin'] as number;
-        const ymax = params['ymax'] as number;
+        const filename = params['filename'] as string | undefined;
+        let xmin = params['xmin'] as number;
+        let xmax = params['xmax'] as number;
+        let ymin = params['ymin'] as number;
+        let ymax = params['ymax'] as number;
         const showAxes = params['showAxes'] !== undefined ? (params['showAxes'] as boolean) : true;
         const showGrid = (params['showGrid'] as boolean) || false;
+        const autoZoom = (params['autoZoom'] as boolean) || false;
+        const zoomPadding = (params['zoomPadding'] as number) ?? 0.2;
         
         const instance = await instancePool.getDefaultInstance();
         
-        // Apply view settings if specified
+        // Auto-zoom if requested (and manual coordinates not provided)
+        if (autoZoom && xmin === undefined && xmax === undefined && ymin === undefined && ymax === undefined) {
+          const objectNames = await instance.getAllObjectNames();
+          const allObjects = [];
+          for (const name of objectNames) {
+            const info = await instance.getObjectInfo(name);
+            if (info) {
+              allObjects.push(info);
+            }
+          }
+          
+          const visiblePoints = allObjects.filter((obj: any) =>
+            obj.type === 'point' && obj.visible && obj.defined &&
+            typeof obj.x === 'number' && typeof obj.y === 'number'
+          );
+          
+          if (visiblePoints.length > 0) {
+            let minX = Infinity;
+            let maxX = -Infinity;
+            let minY = Infinity;
+            let maxY = -Infinity;
+            
+            for (const point of visiblePoints) {
+              minX = Math.min(minX, point.x!);
+              maxX = Math.max(maxX, point.x!);
+              minY = Math.min(minY, point.y!);
+              maxY = Math.max(maxY, point.y!);
+            }
+            
+            let rangeX = maxX - minX;
+            let rangeY = maxY - minY;
+            const minRange = 2;
+            
+            if (rangeX < minRange) {
+              const center = (minX + maxX) / 2;
+              minX = center - minRange / 2;
+              maxX = center + minRange / 2;
+              rangeX = minRange;
+            }
+            
+            if (rangeY < minRange) {
+              const center = (minY + maxY) / 2;
+              minY = center - minRange / 2;
+              maxY = center + minRange / 2;
+              rangeY = minRange;
+            }
+            
+            const padX = rangeX * zoomPadding;
+            const padY = rangeY * zoomPadding;
+            
+            xmin = minX - padX;
+            xmax = maxX + padX;
+            ymin = minY - padY;
+            ymax = maxY + padY;
+          }
+        }
+        
+        // Apply view settings if specified or calculated by auto-zoom
         if (xmin !== undefined && xmax !== undefined && ymin !== undefined && ymax !== undefined) {
           await instance.setCoordSystem(xmin, xmax, ymin, ymax);
         }
@@ -854,6 +1127,30 @@ export const geogebraTools: ToolDefinition[] = [
         }
         
         const svg = await instance.exportSVG();
+        
+        // If filename is provided, save to file
+        if (filename) {
+          const workspaceDir = process.env['VSCODE_WORKSPACE_FOLDER'] || process.cwd();
+          const fullPath = path.resolve(workspaceDir, filename);
+          fs.writeFileSync(fullPath, svg, 'utf8');
+          
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                format: 'SVG',
+                saved: true,
+                filename: fullPath,
+                viewSettings: {
+                  coordSystem: (xmin !== undefined && xmax !== undefined && ymin !== undefined && ymax !== undefined) ? { xmin, xmax, ymin, ymax } : undefined,
+                  showAxes,
+                  showGrid
+                }
+              }, null, 2)
+            }]
+          };
+        }
         
         return {
           content: [{
@@ -890,18 +1187,61 @@ export const geogebraTools: ToolDefinition[] = [
   {
     tool: {
       name: 'geogebra_export_pdf',
-      description: 'Export the current GeoGebra construction as PDF (base64)',
+      description: 'Export the current GeoGebra construction as PDF with optional direct file saving',
       inputSchema: {
         type: 'object',
-        properties: {},
+        properties: {
+          filename: {
+            type: 'string',
+            description: 'Output filename for the PDF file (e.g., "diagram.pdf"). If provided, saves to file instead of returning base64.'
+          },
+          autoZoom: {
+            type: 'boolean',
+            description: 'Automatically zoom to fit all visible objects before exporting (default: false)'
+          },
+          zoomPadding: {
+            type: 'number',
+            description: 'Padding percentage for auto-zoom (default: 0.2 for 20% margin)'
+          }
+        },
         required: []
       }
     },
-    handler: async (_params) => {
+    handler: async (params) => {
       try {
+        const filename = params['filename'] as string | undefined;
+        const autoZoom = (params['autoZoom'] as boolean) || false;
+        const zoomPadding = (params['zoomPadding'] as number) ?? 0.2;
+        const minRange = (params['minRange'] as number) ?? 2;
+        
         const instance = await instancePool.getDefaultInstance();
         
+        // Auto-zoom if requested
+        if (autoZoom) {
+          await instance.applyAutoZoom(zoomPadding, minRange);
+        }
+        
         const pdfBase64 = await instance.exportPDF();
+        
+        // If filename is provided, save to file
+        if (filename) {
+          const workspaceDir = process.env['VSCODE_WORKSPACE_FOLDER'] || process.cwd();
+          const fullPath = instance['validateFilePath'](filename, workspaceDir);
+          const buffer = Buffer.from(pdfBase64, 'base64');
+          await fs.promises.writeFile(fullPath, buffer);
+          
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                format: 'PDF',
+                saved: true,
+                filename: fullPath
+              }, null, 2)
+            }]
+          };
+        }
         
         return {
           content: [{
@@ -916,6 +1256,155 @@ export const geogebraTools: ToolDefinition[] = [
         };
       } catch (error) {
         logger.error('Failed to export PDF', error);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: error instanceof Error ? error.message : String(error)
+            }, null, 2)
+          }],
+          isError: true
+        };
+      }
+    }
+  },
+
+  {
+    tool: {
+      name: 'geogebra_export_ggb',
+      description: 'Export the current GeoGebra construction as a .ggb file with optional direct file saving',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filename: {
+            type: 'string',
+            description: 'Output filename for the GGB file (e.g., "construction.ggb"). If provided, saves to file instead of returning base64.'
+          },
+          autoZoom: {
+            type: 'boolean',
+            description: 'Automatically zoom to fit all visible objects before exporting (default: false)'
+          },
+          zoomPadding: {
+            type: 'number',
+            description: 'Padding percentage for auto-zoom (default: 0.2 for 20% margin)'
+          },
+          minRange: {
+            type: 'number',
+            description: 'Minimum range for each axis when auto-zooming (default: 2)'
+          }
+        },
+        required: []
+      }
+    },
+    handler: async (params) => {
+      try {
+        const filename = params['filename'] as string | undefined;
+        const autoZoom = (params['autoZoom'] as boolean) || false;
+        const zoomPadding = (params['zoomPadding'] as number) ?? 0.2;
+        const minRange = (params['minRange'] as number) ?? 2;
+        
+        const instance = await instancePool.getDefaultInstance();
+        
+        // Auto-zoom if requested
+        if (autoZoom) {
+          await instance.applyAutoZoom(zoomPadding, minRange);
+        }
+        
+        const ggbBase64 = await instance.exportGGB();
+        
+        // If filename is provided, save to file
+        if (filename) {
+          const workspaceDir = process.env['VSCODE_WORKSPACE_FOLDER'] || process.cwd();
+          const fullPath = instance['validateFilePath'](filename, workspaceDir);
+          const buffer = Buffer.from(ggbBase64, 'base64');
+          await fs.promises.writeFile(fullPath, buffer);
+          
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: true,
+                format: 'GGB',
+                saved: true,
+                filename: fullPath
+              }, null, 2)
+            }]
+          };
+        }
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              format: 'GGB',
+              data: ggbBase64,
+              encoding: 'base64'
+            }, null, 2)
+          }]
+        };
+      } catch (error) {
+        logger.error('Failed to export GGB', error);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: error instanceof Error ? error.message : String(error)
+            }, null, 2)
+          }],
+          isError: true
+        };
+      }
+    }
+  },
+
+  // Load GGB Tool
+  {
+    tool: {
+      name: 'geogebra_load_ggb',
+      description: 'Load a GeoGebra construction from a .ggb file or base64 data',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source: {
+            type: 'string',
+            description: 'Either a file path to a .ggb file (e.g., "construction.ggb") or base64-encoded .ggb data'
+          }
+        },
+        required: ['source']
+      }
+    },
+    handler: async (params) => {
+      try {
+        const source = params['source'] as string;
+        
+        if (!source) {
+          throw new Error('source parameter is required');
+        }
+        
+        const instance = await instancePool.getDefaultInstance();
+        
+        // Load the GGB file
+        await instance.loadGGB(source);
+        
+        // Get all objects to confirm load
+        const objectNames = await instance.getAllObjectNames();
+        
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              message: 'GGB file loaded successfully',
+              objectCount: objectNames.length,
+              objects: objectNames
+            }, null, 2)
+          }]
+        };
+      } catch (error) {
+        logger.error('Failed to load GGB', error);
         return {
           content: [{
             type: 'text' as const,
